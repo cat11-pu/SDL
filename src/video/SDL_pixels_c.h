@@ -38,6 +38,7 @@
 
 
 // Pixel format functions
+extern bool SDL_IsValidPixelFormat(SDL_PixelFormat format);
 extern SDL_PixelFormat SDL_PromotePixelFormatToAlpha(SDL_PixelFormat format);
 extern SDL_PixelFormat SDL_PromotePixelFormatTo8888(SDL_PixelFormat format);
 extern void SDL_Get8888AlphaMaskAndShift(const SDL_PixelFormatDetails *fmt, Uint32 *mask, Uint32 *shift);

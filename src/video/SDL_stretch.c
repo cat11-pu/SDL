@@ -41,6 +41,22 @@ static bool SDL_CanLinearStretchFormat(SDL_PixelFormat format)
     return false;
 }
 
+static bool SDL_CheckStretchRect(const char *name, const SDL_Rect *rect, int surface_w, int surface_h)
+{
+    if (!rect) {
+        return SDL_InvalidParamError(name);
+    }
+    if (rect->w <= 0 || rect->h <= 0) {
+        return SDL_SetError("%s has invalid dimensions", name);
+    }
+    if (rect->x < 0 || rect->y < 0 ||
+        (Sint64)rect->x + rect->w > surface_w ||
+        (Sint64)rect->y + rect->h > surface_h) {
+        return SDL_SetError("%s is out of bounds", name);
+    }
+    return true;
+}
+
 bool SDL_StretchSurface(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst, const SDL_Rect *dstrect, SDL_ScaleMode scaleMode)
 {
     bool result;
@@ -49,19 +65,15 @@ bool SDL_StretchSurface(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *
     SDL_Rect full_src;
     SDL_Rect full_dst;
 
-    CHECK_PARAM(!src) {
-        return SDL_InvalidParamError("src");
-    }
-    CHECK_PARAM(!dst) {
-        return SDL_InvalidParamError("dst");
+    if (!SDL_SurfaceValidForBlit(src, "src") ||
+        !SDL_SurfaceValidForBlit(dst, "dst")) {
+        return false;
     }
 
     // Verify the blit rectangles
     if (srcrect) {
-        if ((srcrect->x < 0) || (srcrect->y < 0) ||
-            ((srcrect->x + srcrect->w) > src->w) ||
-            ((srcrect->y + srcrect->h) > src->h)) {
-            return SDL_SetError("Invalid source blit rectangle");
+        if (!SDL_CheckStretchRect("srcrect", srcrect, src->w, src->h)) {
+            return false;
         }
     } else {
         full_src.x = 0;
@@ -71,10 +83,8 @@ bool SDL_StretchSurface(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *
         srcrect = &full_src;
     }
     if (dstrect) {
-        if ((dstrect->x < 0) || (dstrect->y < 0) ||
-            ((dstrect->x + dstrect->w) > dst->w) ||
-            ((dstrect->y + dstrect->h) > dst->h)) {
-            return SDL_SetError("Invalid destination blit rectangle");
+        if (!SDL_CheckStretchRect("dstrect", dstrect, dst->w, dst->h)) {
+            return false;
         }
     } else {
         full_dst.x = 0;
@@ -84,13 +94,20 @@ bool SDL_StretchSurface(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *
         dstrect = &full_dst;
     }
 
-    if (dstrect->w <= 0 || dstrect->h <= 0) {
-        return true;
-    }
-
     if (srcrect->w > SDL_MAX_UINT16 || srcrect->h > SDL_MAX_UINT16 ||
         dstrect->w > SDL_MAX_UINT16 || dstrect->h > SDL_MAX_UINT16) {
         return SDL_SetError("Size too large for scaling");
+    }
+
+    switch (scaleMode) {
+    case SDL_SCALEMODE_NEAREST:
+    case SDL_SCALEMODE_LINEAR:
+        break;
+    case SDL_SCALEMODE_PIXELART:
+        scaleMode = SDL_SCALEMODE_NEAREST;
+        break;
+    default:
+        return SDL_InvalidParamError("scaleMode");
     }
 
     if (src->format != dst->format ||
@@ -124,18 +141,6 @@ bool SDL_StretchSurface(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *
         SDL_DestroySurface(src_tmp);
         SDL_DestroySurface(dst_tmp);
         return result;
-    }
-
-    switch (scaleMode) {
-    case SDL_SCALEMODE_NEAREST:
-        break;
-    case SDL_SCALEMODE_LINEAR:
-        break;
-    case SDL_SCALEMODE_PIXELART:
-        scaleMode = SDL_SCALEMODE_NEAREST;
-        break;
-    default:
-        return SDL_InvalidParamError("scaleMode");
     }
 
     if (scaleMode == SDL_SCALEMODE_LINEAR) {

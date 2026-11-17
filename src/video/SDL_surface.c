@@ -48,6 +48,36 @@ bool SDL_SurfaceValid(SDL_Surface *surface)
     return (surface && surface->reserved == &SDL_surface_magic);
 }
 
+bool SDL_SurfaceValidForBlit(SDL_Surface *surface, const char *param)
+{
+    size_t minimal_pitch;
+
+    if (!SDL_SurfaceValid(surface)) {
+        return SDL_InvalidParamError(param);
+    }
+    if (!SDL_IsValidPixelFormat(surface->format) || !surface->fmt) {
+        return SDL_SetError("%s surface has an invalid pixel format", param);
+    }
+    if (surface->w <= 0 || surface->h <= 0) {
+        return SDL_SetError("%s surface has invalid dimensions", param);
+    }
+    if (!surface->pixels && !SDL_MUSTLOCK(surface)) {
+        return SDL_SetError("%s surface has no pixel data", param);
+    }
+    if (surface->pixels) {
+        if (surface->pitch <= 0) {
+            return SDL_SetError("%s surface has an invalid pitch", param);
+        }
+        if (!SDL_CalculateSurfaceSize(surface->format, surface->w, surface->h, NULL, &minimal_pitch, true)) {
+            return false;
+        }
+        if ((size_t)surface->pitch < minimal_pitch) {
+            return SDL_SetError("%s surface pitch is too small", param);
+        }
+    }
+    return true;
+}
+
 void SDL_UpdateSurfaceLockFlag(SDL_Surface *surface)
 {
     // We need to mark the surface as needing unlock while locked
@@ -207,7 +237,7 @@ static SDL_Surface *SDL_CreateSurfaceInternal(int width, int height, SDL_PixelFo
         return NULL;
     }
 
-    CHECK_PARAM(format == SDL_PIXELFORMAT_UNKNOWN) {
+    CHECK_PARAM(!SDL_IsValidPixelFormat(format)) {
         SDL_InvalidParamError("format");
         return NULL;
     }
@@ -283,7 +313,7 @@ SDL_Surface *SDL_CreateSurfaceFrom(int width, int height, SDL_PixelFormat format
         return NULL;
     }
 
-    CHECK_PARAM(format == SDL_PIXELFORMAT_UNKNOWN) {
+    CHECK_PARAM(!SDL_IsValidPixelFormat(format)) {
         SDL_InvalidParamError("format");
         return NULL;
     }
@@ -1034,9 +1064,57 @@ bool SDL_GetSurfaceClipRect(SDL_Surface *surface, SDL_Rect *rect)
  * you know exactly what you are doing, you can optimize your code
  * by calling the one(s) you need.
  */
+static bool SDL_BlitRectMathMayOverflow(const SDL_Rect *rect)
+{
+    return (rect->x <= SDL_MIN_SINT32 / 2 || rect->x >= SDL_MAX_SINT32 / 2 ||
+            rect->y <= SDL_MIN_SINT32 / 2 || rect->y >= SDL_MAX_SINT32 / 2 ||
+            rect->w >= SDL_MAX_SINT32 / 2 || rect->h >= SDL_MAX_SINT32 / 2 ||
+            (Sint64)rect->x + rect->w > SDL_MAX_SINT32 ||
+            (Sint64)rect->y + rect->h > SDL_MAX_SINT32);
+}
+
+static bool SDL_CheckBlitRectInput(const char *name, const SDL_Rect *rect, bool allow_empty)
+{
+    if (!rect) {
+        return SDL_InvalidParamError(name);
+    }
+    if (rect->w < 0 || rect->h < 0 || (!allow_empty && (rect->w == 0 || rect->h == 0))) {
+        return SDL_SetError("%s has invalid dimensions", name);
+    }
+    if (SDL_BlitRectMathMayOverflow(rect)) {
+        return SDL_SetError("%s is too large", name);
+    }
+    return true;
+}
+
+static bool SDL_CheckUncheckedBlitRect(const char *name, const SDL_Rect *rect, int surface_w, int surface_h)
+{
+    if (!rect) {
+        return SDL_InvalidParamError(name);
+    }
+    if (rect->w <= 0 || rect->h <= 0) {
+        return SDL_SetError("%s has invalid dimensions", name);
+    }
+    if (rect->x < 0 || rect->y < 0 ||
+        (Sint64)rect->x + rect->w > surface_w ||
+        (Sint64)rect->y + rect->h > surface_h) {
+        return SDL_SetError("%s is out of bounds", name);
+    }
+    return true;
+}
+
 bool SDL_BlitSurfaceUnchecked(SDL_Surface *src, const SDL_Rect *srcrect,
                              SDL_Surface *dst, const SDL_Rect *dstrect)
 {
+    if (!SDL_SurfaceValidForBlit(src, "src") ||
+        !SDL_SurfaceValidForBlit(dst, "dst")) {
+        return false;
+    }
+    if (!SDL_CheckUncheckedBlitRect("srcrect", srcrect, src->w, src->h) ||
+        !SDL_CheckUncheckedBlitRect("dstrect", dstrect, dst->w, dst->h)) {
+        return false;
+    }
+
     // Check to make sure the blit mapping is valid
     if (!SDL_ValidateMap(src, dst)) {
         return false;
@@ -1048,15 +1126,16 @@ bool SDL_BlitSurface(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst
 {
     SDL_Rect r_src, r_dst;
 
-    // Make sure the surfaces aren't locked
-    CHECK_PARAM(!SDL_SurfaceValid(src) || (!src->pixels && !SDL_MUSTLOCK(src))) {
-        return SDL_InvalidParamError("src");
-    }
-    CHECK_PARAM(!SDL_SurfaceValid(dst) || (!dst->pixels && !SDL_MUSTLOCK(dst))) {
-        return SDL_InvalidParamError("dst");
+    if (!SDL_SurfaceValidForBlit(src, "src") ||
+        !SDL_SurfaceValidForBlit(dst, "dst")) {
+        return false;
     }
     CHECK_PARAM((src->flags & SDL_SURFACE_LOCKED) || (dst->flags & SDL_SURFACE_LOCKED)) {
         return SDL_SetError("Surfaces must not be locked during blit");
+    }
+    if ((srcrect && !SDL_CheckBlitRectInput("srcrect", srcrect, true)) ||
+        (dstrect && !SDL_CheckBlitRectInput("dstrect", dstrect, true))) {
+        return false;
     }
 
     // Full src surface
@@ -1077,6 +1156,9 @@ bool SDL_BlitSurface(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst
     if (srcrect) {
         SDL_Rect tmp;
         if (SDL_GetRectIntersection(srcrect, &r_src, &tmp) == false) {
+            if (SDL_BlitRectMathMayOverflow(srcrect) || SDL_BlitRectMathMayOverflow(&r_src)) {
+                return SDL_SetError("Source rectangle is too large");
+            }
             return true;
         }
 
@@ -1095,7 +1177,13 @@ bool SDL_BlitSurface(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst
     // clip the destination rectangle against the clip rectangle
     {
         SDL_Rect tmp;
+        if (SDL_BlitRectMathMayOverflow(&r_dst) || SDL_BlitRectMathMayOverflow(&dst->clip_rect)) {
+            return SDL_SetError("Destination rectangle is too large");
+        }
         if (SDL_GetRectIntersection(&r_dst, &dst->clip_rect, &tmp) == false) {
+            if (SDL_BlitRectMathMayOverflow(&r_dst) || SDL_BlitRectMathMayOverflow(&dst->clip_rect)) {
+                return SDL_SetError("Destination rectangle is too large");
+            }
             return true;
         }
 
@@ -1125,14 +1213,20 @@ bool SDL_BlitSurface(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst
 
 static bool SDL_BlitSurfaceClippedScaled(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst, const SDL_Rect *dstrect, SDL_ScaleMode scaleMode)
 {
-    // We need to scale first, then blit into dst because we're clipping in the destination surface pixel coordinates
+    // The source rectangle has already been mapped to the visible destination area.
     bool result;
     int saved_w = src->w;
     int saved_h = src->h;
     void *saved_pixels = src->pixels;
+    size_t x_offset;
     src->w = srcrect->w;
     src->h = srcrect->h;
-    src->pixels = (Uint8 *)src->pixels + srcrect->y * src->pitch + srcrect->x * SDL_BYTESPERPIXEL(src->format);
+    if (SDL_BITSPERPIXEL(src->format) >= 8) {
+        x_offset = (size_t)srcrect->x * SDL_BYTESPERPIXEL(src->format);
+    } else {
+        x_offset = ((size_t)srcrect->x * SDL_BITSPERPIXEL(src->format)) / 8;
+    }
+    src->pixels = (Uint8 *)src->pixels + srcrect->y * src->pitch + x_offset;
     SDL_Surface *scaled = SDL_ScaleSurface(src, dstrect->w, dstrect->h, scaleMode);
     if (scaled) {
         result = SDL_BlitSurface(scaled, NULL, dst, dstrect);
@@ -1146,17 +1240,59 @@ static bool SDL_BlitSurfaceClippedScaled(SDL_Surface *src, const SDL_Rect *srcre
     return result;
 }
 
+static bool SDL_GetClippedScaledSourceRect(const SDL_Rect *srcrect, const SDL_Rect *dstrect, const SDL_Rect *clipped, SDL_Rect *result)
+{
+    Sint64 left, right, top, bottom;
+
+    if (!srcrect || !dstrect || !clipped || !result ||
+        srcrect->w <= 0 || srcrect->h <= 0 ||
+        dstrect->w <= 0 || dstrect->h <= 0 ||
+        clipped->w <= 0 || clipped->h <= 0) {
+        return SDL_SetError("Invalid scaled blit rectangle");
+    }
+
+    // Round the visible edges outward so no destination pixel loses its source.
+    left = ((Sint64)((Sint64)clipped->x - dstrect->x) * srcrect->w) / dstrect->w;
+    right = (((Sint64)((Sint64)clipped->x + clipped->w - dstrect->x) * srcrect->w) + dstrect->w - 1) / dstrect->w;
+    top = ((Sint64)((Sint64)clipped->y - dstrect->y) * srcrect->h) / dstrect->h;
+    bottom = (((Sint64)((Sint64)clipped->y + clipped->h - dstrect->y) * srcrect->h) + dstrect->h - 1) / dstrect->h;
+
+    if (left < 0) {
+        left = 0;
+    } else if (left >= srcrect->w) {
+        left = srcrect->w - 1;
+    }
+    if (top < 0) {
+        top = 0;
+    } else if (top >= srcrect->h) {
+        top = srcrect->h - 1;
+    }
+    if (right <= left) {
+        right = left + 1;
+    } else if (right > srcrect->w) {
+        right = srcrect->w;
+    }
+    if (bottom <= top) {
+        bottom = top + 1;
+    } else if (bottom > srcrect->h) {
+        bottom = srcrect->h;
+    }
+
+    result->x = srcrect->x + (int)left;
+    result->y = srcrect->y + (int)top;
+    result->w = (int)(right - left);
+    result->h = (int)(bottom - top);
+    return true;
+}
+
 bool SDL_BlitSurfaceScaled(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst, const SDL_Rect *dstrect, SDL_ScaleMode scaleMode)
 {
     SDL_Rect r_src, r_dst;
     bool result;
 
-    // Make sure the surfaces aren't locked
-    CHECK_PARAM(!SDL_SurfaceValid(src) || (!src->pixels && !SDL_MUSTLOCK(src))) {
-        return SDL_InvalidParamError("src");
-    }
-    CHECK_PARAM(!SDL_SurfaceValid(dst) || (!dst->pixels && !SDL_MUSTLOCK(dst))) {
-        return SDL_InvalidParamError("dst");
+    if (!SDL_SurfaceValidForBlit(src, "src") ||
+        !SDL_SurfaceValidForBlit(dst, "dst")) {
+        return false;
     }
     CHECK_PARAM((src->flags & SDL_SURFACE_LOCKED) || (dst->flags & SDL_SURFACE_LOCKED)) {
         return SDL_SetError("Surfaces must not be locked during blit");
@@ -1174,6 +1310,11 @@ bool SDL_BlitSurfaceScaled(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surfac
         return SDL_InvalidParamError("scaleMode");
     }
 
+    if ((srcrect && !SDL_CheckBlitRectInput("srcrect", srcrect, true)) ||
+        (dstrect && !SDL_CheckBlitRectInput("dstrect", dstrect, false))) {
+        return false;
+    }
+
     int src_w = srcrect ? srcrect->w : src->w;
     int src_h = srcrect ? srcrect->h : src->h;
     int dst_w = dstrect ? dstrect->w : dst->w;
@@ -1181,11 +1322,6 @@ bool SDL_BlitSurfaceScaled(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surfac
     if (src_w == dst_w && src_h == dst_h) {
         // No scaling, defer to regular blit
         return SDL_BlitSurface(src, srcrect, dst, dstrect);
-    }
-
-    if (src->w == 0 || src->h == 0) {
-        // Nothing to do
-        return true;
     }
 
     // Full src surface
@@ -1214,27 +1350,54 @@ bool SDL_BlitSurfaceScaled(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surfac
         desired.w = SDL_max(srcrect->w, 1);
         desired.h = SDL_max(srcrect->h, 1);
         if (SDL_GetRectIntersection(&desired, &r_src, &tmp) == false) {
+            if (SDL_BlitRectMathMayOverflow(&desired) || SDL_BlitRectMathMayOverflow(&r_src)) {
+                return SDL_SetError("Source rectangle is too large");
+            }
             return true;
         }
 
-        // Shift dstrect, if srcrect origin has changed
-        r_dst.x += (tmp.x - desired.x) * r_dst.w / desired.w;
-        r_dst.y += (tmp.y - desired.y) * r_dst.h / desired.h;
-        r_dst.w += (tmp.w - desired.w) * r_dst.w / desired.w;
-        r_dst.h += (tmp.h - desired.h) * r_dst.h / desired.h;
+        {
+            // Shift dstrect, if srcrect origin has changed
+            Sint64 dst_x = (Sint64)r_dst.x + ((Sint64)((Sint64)tmp.x - desired.x) * r_dst.w) / desired.w;
+            Sint64 dst_y = (Sint64)r_dst.y + ((Sint64)((Sint64)tmp.y - desired.y) * r_dst.h) / desired.h;
+            Sint64 dst_width = (Sint64)r_dst.w + ((Sint64)((Sint64)tmp.w - desired.w) * r_dst.w) / desired.w;
+            Sint64 dst_height = (Sint64)r_dst.h + ((Sint64)((Sint64)tmp.h - desired.h) * r_dst.h) / desired.h;
+
+            if (dst_x < SDL_MIN_SINT32 || dst_x > SDL_MAX_SINT32 ||
+                dst_y < SDL_MIN_SINT32 || dst_y > SDL_MAX_SINT32 ||
+                dst_width <= 0 || dst_width > SDL_MAX_SINT32 ||
+                dst_height <= 0 || dst_height > SDL_MAX_SINT32) {
+                return SDL_SetError("Scaled blit rectangle is too large");
+            }
+            r_dst.x = (int)dst_x;
+            r_dst.y = (int)dst_y;
+            r_dst.w = (int)dst_width;
+            r_dst.h = (int)dst_height;
+        }
 
         // Update srcrect
         r_src = tmp;
     }
 
     SDL_Rect tmp;
+    if (SDL_BlitRectMathMayOverflow(&r_dst) || SDL_BlitRectMathMayOverflow(&dst->clip_rect)) {
+        return SDL_SetError("Destination rectangle is too large");
+    }
     if (SDL_GetRectIntersection(&r_dst, &dst->clip_rect, &tmp) == false) {
+        if (SDL_BlitRectMathMayOverflow(&r_dst) || SDL_BlitRectMathMayOverflow(&dst->clip_rect)) {
+            return SDL_SetError("Destination rectangle is too large");
+        }
         return true;
     }
 
     if (tmp.x != r_dst.x || tmp.y != r_dst.y || tmp.w != r_dst.w || tmp.h != r_dst.h) {
-        // Need to do a clipped and scaled blit
-        return SDL_BlitSurfaceClippedScaled(src, &r_src, dst, &r_dst, scaleMode);
+        // Scale only the visible portion so an oversized destination rectangle
+        // cannot force a huge temporary allocation.
+        SDL_Rect clipped_src;
+        if (!SDL_GetClippedScaledSourceRect(&r_src, &r_dst, &tmp, &clipped_src)) {
+            return false;
+        }
+        return SDL_BlitSurfaceClippedScaled(src, &clipped_src, dst, &tmp, scaleMode);
     }
 
     if (SDL_MUSTLOCK(src)) {
@@ -1269,6 +1432,25 @@ bool SDL_BlitSurfaceScaled(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surfac
 bool SDL_BlitSurfaceUncheckedScaled(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface *dst, const SDL_Rect *dstrect, SDL_ScaleMode scaleMode)
 {
     static const Uint32 complex_copy_flags = (SDL_COPY_MODULATE_MASK | SDL_COPY_BLEND_MASK | SDL_COPY_COLORKEY);
+
+    if (!SDL_SurfaceValidForBlit(src, "src") ||
+        !SDL_SurfaceValidForBlit(dst, "dst")) {
+        return false;
+    }
+    if (!SDL_CheckUncheckedBlitRect("srcrect", srcrect, src->w, src->h) ||
+        !SDL_CheckUncheckedBlitRect("dstrect", dstrect, dst->w, dst->h)) {
+        return false;
+    }
+    switch (scaleMode) {
+    case SDL_SCALEMODE_NEAREST:
+    case SDL_SCALEMODE_LINEAR:
+        break;
+    case SDL_SCALEMODE_PIXELART:
+        scaleMode = SDL_SCALEMODE_NEAREST;
+        break;
+    default:
+        return SDL_InvalidParamError("scaleMode");
+    }
 
     if (srcrect->w > SDL_MAX_UINT16 || srcrect->h > SDL_MAX_UINT16 ||
         dstrect->w > SDL_MAX_UINT16 || dstrect->h > SDL_MAX_UINT16) {
@@ -1391,15 +1573,16 @@ bool SDL_BlitSurfaceTiled(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface
 {
     SDL_Rect r_src, r_dst;
 
-    // Make sure the surfaces aren't locked
-    CHECK_PARAM(!SDL_SurfaceValid(src)) {
-        return SDL_InvalidParamError("src");
-    }
-    CHECK_PARAM(!SDL_SurfaceValid(dst)) {
-        return SDL_InvalidParamError("dst");
+    if (!SDL_SurfaceValidForBlit(src, "src") ||
+        !SDL_SurfaceValidForBlit(dst, "dst")) {
+        return false;
     }
     CHECK_PARAM((src->flags & SDL_SURFACE_LOCKED) || (dst->flags & SDL_SURFACE_LOCKED)) {
         return SDL_SetError("Surfaces must not be locked during blit");
+    }
+    if ((srcrect && !SDL_CheckBlitRectInput("srcrect", srcrect, false)) ||
+        (dstrect && !SDL_CheckBlitRectInput("dstrect", dstrect, false))) {
+        return false;
     }
 
     // Full src surface
@@ -1423,6 +1606,9 @@ bool SDL_BlitSurfaceTiled(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface
     // clip the source rectangle to the source surface
     if (srcrect) {
         if (SDL_GetRectIntersection(srcrect, &r_src, &r_src) == false) {
+            if (SDL_BlitRectMathMayOverflow(srcrect) || SDL_BlitRectMathMayOverflow(&r_src)) {
+                return SDL_SetError("Source rectangle is too large");
+            }
             return true;
         }
 
@@ -1431,11 +1617,23 @@ bool SDL_BlitSurfaceTiled(SDL_Surface *src, const SDL_Rect *srcrect, SDL_Surface
 
     // clip the destination rectangle against the clip rectangle
     {
+        if (SDL_BlitRectMathMayOverflow(&r_dst) || SDL_BlitRectMathMayOverflow(&dst->clip_rect)) {
+            return SDL_SetError("Destination rectangle is too large");
+        }
         if (SDL_GetRectIntersection(&r_dst, &dst->clip_rect, &r_dst) == false) {
+            if (SDL_BlitRectMathMayOverflow(&r_dst) || SDL_BlitRectMathMayOverflow(&dst->clip_rect)) {
+                return SDL_SetError("Destination rectangle is too large");
+            }
             return true;
         }
 
         // For tiling we don't adjust the source rectangle
+    }
+    if (r_src.w <= 0 || r_src.h <= 0) {
+        return SDL_SetError("Source rectangle has invalid dimensions");
+    }
+    if (r_dst.w <= 0 || r_dst.h <= 0) {
+        return SDL_SetError("Destination rectangle has invalid dimensions");
     }
 
     // Switch back to a fast blit if we were previously stretching
@@ -1498,18 +1696,19 @@ bool SDL_BlitSurfaceTiledWithScale(SDL_Surface *src, const SDL_Rect *srcrect, fl
 {
     SDL_Rect r_src, r_dst;
 
-    // Make sure the surfaces aren't locked
-    CHECK_PARAM(!SDL_SurfaceValid(src)) {
-        return SDL_InvalidParamError("src");
-    }
-    CHECK_PARAM(!SDL_SurfaceValid(dst)) {
-        return SDL_InvalidParamError("dst");
+    if (!SDL_SurfaceValidForBlit(src, "src") ||
+        !SDL_SurfaceValidForBlit(dst, "dst")) {
+        return false;
     }
     CHECK_PARAM((src->flags & SDL_SURFACE_LOCKED) || (dst->flags & SDL_SURFACE_LOCKED)) {
         return SDL_SetError("Surfaces must not be locked during blit");
     }
-    CHECK_PARAM(scale < 0.0f) {
+    if (!(scale > 0.0f) || scale > (float)SDL_MAX_SINT32) {
         return SDL_InvalidParamError("scale");
+    }
+    if ((srcrect && !SDL_CheckBlitRectInput("srcrect", srcrect, false)) ||
+        (dstrect && !SDL_CheckBlitRectInput("dstrect", dstrect, false))) {
+        return false;
     }
 
     // Full src surface
@@ -1533,6 +1732,9 @@ bool SDL_BlitSurfaceTiledWithScale(SDL_Surface *src, const SDL_Rect *srcrect, fl
     // clip the source rectangle to the source surface
     if (srcrect) {
         if (SDL_GetRectIntersection(srcrect, &r_src, &r_src) == false) {
+            if (SDL_BlitRectMathMayOverflow(srcrect) || SDL_BlitRectMathMayOverflow(&r_src)) {
+                return SDL_SetError("Source rectangle is too large");
+            }
             return true;
         }
 
@@ -1541,11 +1743,23 @@ bool SDL_BlitSurfaceTiledWithScale(SDL_Surface *src, const SDL_Rect *srcrect, fl
 
     // clip the destination rectangle against the clip rectangle
     {
+        if (SDL_BlitRectMathMayOverflow(&r_dst) || SDL_BlitRectMathMayOverflow(&dst->clip_rect)) {
+            return SDL_SetError("Destination rectangle is too large");
+        }
         if (SDL_GetRectIntersection(&r_dst, &dst->clip_rect, &r_dst) == false) {
+            if (SDL_BlitRectMathMayOverflow(&r_dst) || SDL_BlitRectMathMayOverflow(&dst->clip_rect)) {
+                return SDL_SetError("Destination rectangle is too large");
+            }
             return true;
         }
 
         // For tiling we don't adjust the source rectangle
+    }
+    if (r_src.w <= 0 || r_src.h <= 0) {
+        return SDL_SetError("Source rectangle has invalid dimensions");
+    }
+    if (r_dst.w <= 0 || r_dst.h <= 0) {
+        return SDL_SetError("Destination rectangle has invalid dimensions");
     }
 
     // Switch back to a fast blit if we were previously stretching
@@ -1554,11 +1768,16 @@ bool SDL_BlitSurfaceTiledWithScale(SDL_Surface *src, const SDL_Rect *srcrect, fl
         SDL_InvalidateMap(&src->map);
     }
 
-    int tile_width = (int)SDL_roundf(r_src.w * scale);
-    int tile_height = (int)SDL_roundf(r_src.h * scale);
+    double scaled_width = (double)r_src.w * scale;
+    double scaled_height = (double)r_src.h * scale;
+    if (!(scaled_width >= 1.0 && scaled_width <= SDL_MAX_SINT32) ||
+        !(scaled_height >= 1.0 && scaled_height <= SDL_MAX_SINT32)) {
+        return SDL_SetError("Scaled tile size is out of range");
+    }
+    int tile_width = (int)SDL_roundf((float)scaled_width);
+    int tile_height = (int)SDL_roundf((float)scaled_height);
     if (tile_width <= 0 || tile_height <= 0) {
-        // Nothing to do
-        return true;
+        return SDL_SetError("Scaled tile size is zero");
     }
     int rows = r_dst.h / tile_height;
     int cols = r_dst.w / tile_width;
@@ -1566,6 +1785,8 @@ bool SDL_BlitSurfaceTiledWithScale(SDL_Surface *src, const SDL_Rect *srcrect, fl
     int remaining_dst_h = (r_dst.h - rows * tile_height);
     int remaining_src_w = (int)(remaining_dst_w / scale);
     int remaining_src_h = (int)(remaining_dst_h / scale);
+    remaining_src_w = SDL_clamp(remaining_src_w, 1, r_src.w);
+    remaining_src_h = SDL_clamp(remaining_src_h, 1, r_src.h);
     SDL_Rect curr_src, curr_dst;
 
     SDL_copyp(&curr_src, &r_src);
@@ -1621,12 +1842,13 @@ bool SDL_BlitSurface9Grid(SDL_Surface *src, const SDL_Rect *srcrect, int left_wi
     int dst_top_height;
     int dst_bottom_height;
 
-    // Make sure the surfaces aren't locked
-    CHECK_PARAM(!SDL_SurfaceValid(src)) {
-        return SDL_InvalidParamError("src");
+    if (!SDL_SurfaceValidForBlit(src, "src") ||
+        !SDL_SurfaceValidForBlit(dst, "dst")) {
+        return false;
     }
-    CHECK_PARAM(!SDL_SurfaceValid(dst)) {
-        return SDL_InvalidParamError("dst");
+    if (left_width < 0 || right_width < 0 || top_height < 0 || bottom_height < 0 ||
+        !(scale >= 0.0f) || scale > (float)SDL_MAX_SINT32) {
+        return SDL_SetError("Invalid 9-grid dimensions");
     }
 
     if (!srcrect) {
@@ -1644,6 +1866,14 @@ bool SDL_BlitSurface9Grid(SDL_Surface *src, const SDL_Rect *srcrect, int left_wi
         full_dst.h = dst->h;
         dstrect = &full_dst;
     }
+    if (!SDL_CheckBlitRectInput("srcrect", srcrect, false) ||
+        !SDL_CheckBlitRectInput("dstrect", dstrect, false)) {
+        return false;
+    }
+    if ((Sint64)left_width + right_width > srcrect->w ||
+        (Sint64)top_height + bottom_height > srcrect->h) {
+        return SDL_SetError("Invalid 9-grid dimensions");
+    }
 
     if (scale <= 0.0f || scale == 1.0f) {
         dst_left_width = left_width;
@@ -1651,10 +1881,18 @@ bool SDL_BlitSurface9Grid(SDL_Surface *src, const SDL_Rect *srcrect, int left_wi
         dst_top_height = top_height;
         dst_bottom_height = bottom_height;
     } else {
-        dst_left_width = (int)SDL_roundf(left_width * scale);
-        dst_right_width = (int)SDL_roundf(right_width * scale);
-        dst_top_height = (int)SDL_roundf(top_height * scale);
-        dst_bottom_height = (int)SDL_roundf(bottom_height * scale);
+        double scaled_left = (double)left_width * scale;
+        double scaled_right = (double)right_width * scale;
+        double scaled_top = (double)top_height * scale;
+        double scaled_bottom = (double)bottom_height * scale;
+        if (scaled_left > SDL_MAX_SINT32 || scaled_right > SDL_MAX_SINT32 ||
+            scaled_top > SDL_MAX_SINT32 || scaled_bottom > SDL_MAX_SINT32) {
+            return SDL_SetError("Scaled 9-grid dimensions are too large");
+        }
+        dst_left_width = (int)SDL_roundf((float)scaled_left);
+        dst_right_width = (int)SDL_roundf((float)scaled_right);
+        dst_top_height = (int)SDL_roundf((float)scaled_top);
+        dst_bottom_height = (int)SDL_roundf((float)scaled_bottom);
     }
 
     // Upper-left corner

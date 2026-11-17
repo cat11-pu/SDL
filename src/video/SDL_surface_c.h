@@ -85,6 +85,7 @@ struct SDL_Surface
 
 // Surface functions
 extern bool SDL_SurfaceValid(SDL_Surface *surface);
+extern bool SDL_SurfaceValidForBlit(SDL_Surface *surface, const char *param);
 extern void SDL_UpdateSurfaceLockFlag(SDL_Surface *surface);
 extern bool SDL_CalculateSurfaceSize(SDL_PixelFormat format, int width, int height, size_t *size, size_t *pitch, bool minimalPitch);
 extern float SDL_GetDefaultSDRWhitePoint(SDL_Colorspace colorspace);

@@ -236,9 +236,19 @@ const char *SDL_GetPixelFormatName(SDL_PixelFormat format)
 }
 #undef CASE
 
+bool SDL_IsValidPixelFormat(SDL_PixelFormat format)
+{
+    return (format != SDL_PIXELFORMAT_UNKNOWN &&
+            SDL_strcmp(SDL_GetPixelFormatName(format), "SDL_PIXELFORMAT_UNKNOWN") != 0);
+}
+
 bool SDL_GetMasksForPixelFormat(SDL_PixelFormat format, int *bpp, Uint32 *Rmask, Uint32 *Gmask, Uint32 *Bmask, Uint32 *Amask)
 {
     Uint32 masks[4];
+
+    if (format != SDL_PIXELFORMAT_UNKNOWN && !SDL_IsValidPixelFormat(format)) {
+        return SDL_SetError("Unknown pixel format");
+    }
 
 #ifdef SDL_HAVE_YUV
     // Partial support for SDL_Surface with FOURCC
@@ -865,6 +875,11 @@ const SDL_PixelFormatDetails *SDL_GetPixelFormatDetails(SDL_PixelFormat format)
 {
     SDL_PixelFormatDetails *details;
 
+    if (format != SDL_PIXELFORMAT_UNKNOWN && !SDL_IsValidPixelFormat(format)) {
+        SDL_SetError("Unknown pixel format");
+        return NULL;
+    }
+
     if (SDL_ShouldInit(&SDL_format_details_init)) {
         SDL_format_details = SDL_CreateHashTable(0, true, SDL_HashID, SDL_KeyMatchID, SDL_DestroyHashValue, NULL);
         if (!SDL_format_details) {
@@ -1437,6 +1452,23 @@ void SDL_DetectPalette(const SDL_Palette *pal, bool *is_opaque, bool *has_alpha_
 }
 
 // Find the opaque pixel value corresponding to an RGB triple
+static Uint32 SDL_Map8BitComponent(Uint8 value, Uint8 bits)
+{
+    if (bits == 0) {
+        return 0;
+    }
+    if (bits < 8) {
+        return value >> (8 - bits);
+    }
+    if (bits == 10) {
+        return SDL_expand_byte_10[value];
+    }
+    if (bits >= 32) {
+        return (Uint32)value * 0x01010101u;
+    }
+    return ((Uint32)value * ((((Uint32)1) << bits) - 1) + 127) / 255;
+}
+
 Uint32 SDL_MapRGB(const SDL_PixelFormatDetails *format, const SDL_Palette *palette, Uint8 r, Uint8 g, Uint8 b)
 {
     CHECK_PARAM(!format) {
@@ -1458,9 +1490,9 @@ Uint32 SDL_MapRGB(const SDL_PixelFormatDetails *format, const SDL_Palette *palet
                (((Uint32)SDL_expand_byte_10[b]) << format->Bshift) |
                format->Amask;
     } else {
-        return ((Uint32)(r >> (8 - format->Rbits))) << format->Rshift |
-               ((Uint32)(g >> (8 - format->Gbits))) << format->Gshift |
-               ((Uint32)(b >> (8 - format->Bbits))) << format->Bshift |
+        return SDL_Map8BitComponent(r, format->Rbits) << format->Rshift |
+               SDL_Map8BitComponent(g, format->Gbits) << format->Gshift |
+               SDL_Map8BitComponent(b, format->Bbits) << format->Bshift |
                format->Amask;
     }
 }
@@ -1487,10 +1519,10 @@ Uint32 SDL_MapRGBA(const SDL_PixelFormatDetails *format, const SDL_Palette *pale
                (((Uint32)SDL_expand_byte_10[b]) << format->Bshift) |
                ((((Uint32)(a >> (8 - format->Abits))) << format->Ashift) & format->Amask);
     } else {
-        return ((Uint32)(r >> (8 - format->Rbits))) << format->Rshift |
-               ((Uint32)(g >> (8 - format->Gbits))) << format->Gshift |
-               ((Uint32)(b >> (8 - format->Bbits))) << format->Bshift |
-               ((((Uint32)(a >> (8 - format->Abits))) << format->Ashift) & format->Amask);
+        return SDL_Map8BitComponent(r, format->Rbits) << format->Rshift |
+               SDL_Map8BitComponent(g, format->Gbits) << format->Gshift |
+               SDL_Map8BitComponent(b, format->Bbits) << format->Bshift |
+               ((SDL_Map8BitComponent(a, format->Abits) << format->Ashift) & format->Amask);
     }
 }
 
@@ -1661,8 +1693,13 @@ static Uint8 *Map1toN(const SDL_Palette *pal, Uint8 Rmod, Uint8 Gmod, Uint8 Bmod
         Uint8 G = (Uint8)((pal->colors[i].g * Gmod) / 255);
         Uint8 B = (Uint8)((pal->colors[i].b * Bmod) / 255);
         Uint8 A = (Uint8)((pal->colors[i].a * Amod) / 255);
-        ASSEMBLE_RGBA(&map[i * bpp], SDL_BYTESPERPIXEL(dst->format), dst, (Uint32)R,
-                      (Uint32)G, (Uint32)B, (Uint32)A);
+        if (SDL_ISPIXELFORMAT_10BIT(dst->format) || dst->Rbits > 8 || dst->Gbits > 8 || dst->Bbits > 8 || dst->Abits > 8) {
+            Uint32 pixel = SDL_MapRGBA(dst, NULL, R, G, B, A);
+            SDL_memcpy(&map[i * bpp], &pixel, sizeof(pixel));
+        } else {
+            ASSEMBLE_RGBA(&map[i * bpp], SDL_BYTESPERPIXEL(dst->format), dst, (Uint32)R,
+                          (Uint32)G, (Uint32)B, (Uint32)A);
+        }
     }
     return map;
 }
@@ -1783,4 +1820,3 @@ bool SDL_MapSurface(SDL_Surface *src, SDL_Surface *dst)
     // Choose your blitters wisely
     return SDL_CalculateBlit(src, dst);
 }
-

@@ -307,15 +307,24 @@ static void AssertFileExist(const char *filename)
  */
 static int SDLCALL surface_testInvalidFormat(void *arg)
 {
+    const SDL_PixelFormat invalid_formats[] = {
+        SDL_PIXELFORMAT_UNKNOWN,
+        SDL_DEFINE_PIXELFORMAT(SDL_PIXELTYPE_PACKED32, SDL_PACKEDORDER_ABGR, SDL_PACKEDLAYOUT_1010102 + 1, 32, 4),
+        SDL_DEFINE_PIXELFORMAT(SDL_PIXELTYPE_UNKNOWN, 0, 0, 32, 4),
+        SDL_DEFINE_PIXELFORMAT(SDL_PIXELTYPE_INDEX8, 0, 0, 1, 1)
+    };
     SDL_Surface *surface;
+    int i;
 
-    surface = SDL_CreateSurface(32, 32, SDL_PIXELFORMAT_UNKNOWN);
-    SDLTest_AssertCheck(surface == NULL, "Verify SDL_CreateSurface(SDL_PIXELFORMAT_UNKNOWN) returned NULL");
-    SDL_DestroySurface(surface);
+    for (i = 0; i < SDL_arraysize(invalid_formats); ++i) {
+        surface = SDL_CreateSurface(32, 32, invalid_formats[i]);
+        SDLTest_AssertCheck(surface == NULL, "Verify SDL_CreateSurface(0x%" SDL_PRIx32 ") returned NULL", invalid_formats[i]);
+        SDL_DestroySurface(surface);
 
-    surface = SDL_CreateSurfaceFrom(32, 32, SDL_PIXELFORMAT_UNKNOWN, NULL, 0);
-    SDLTest_AssertCheck(surface == NULL, "Verify SDL_CreateSurfaceFrom(SDL_PIXELFORMAT_UNKNOWN) returned NULL");
-    SDL_DestroySurface(surface);
+        surface = SDL_CreateSurfaceFrom(32, 32, invalid_formats[i], NULL, 0);
+        SDLTest_AssertCheck(surface == NULL, "Verify SDL_CreateSurfaceFrom(0x%" SDL_PRIx32 ") returned NULL", invalid_formats[i]);
+        SDL_DestroySurface(surface);
+    }
 
     return TEST_COMPLETED;
 }
@@ -1304,7 +1313,8 @@ static int SDLCALL surface_testBlitTiled(void *arg)
     {
         float tiny_scale = 0.01f;
         ret = SDL_BlitSurfaceTiledWithScale(face, NULL, tiny_scale, SDL_SCALEMODE_NEAREST, testSurface, NULL);
-        SDLTest_AssertCheck(ret == true, "Expected SDL_BlitSurfaceTiledWithScale to succeed with very small scale: %f, got: %i", tiny_scale, ret);
+        SDLTest_AssertCheck(ret == false, "Expected SDL_BlitSurfaceTiledWithScale to fail with a zero-sized tile, got: %i", ret);
+        SDLTest_AssertCheck(SDL_GetError()[0] != '\0', "Expected a meaningful error for a zero-sized tile");
     }
 
     /* Clean up. */
@@ -2073,7 +2083,8 @@ static int SDLCALL surface_testBlitBitmap(void *arg)
  */
 static int SDLCALL surface_testBlitInvalid(void *arg)
 {
-    SDL_Surface *valid, *invalid;
+    Uint8 pixels[16];
+    SDL_Surface *valid, *invalid, *zero_width, *zero_height;
     bool result;
 
     valid = SDL_CreateSurface(1, 1, SDL_PIXELFORMAT_RGBA8888);
@@ -2081,6 +2092,10 @@ static int SDLCALL surface_testBlitInvalid(void *arg)
     invalid = SDL_CreateSurface(0, 0, SDL_PIXELFORMAT_RGBA8888);
     SDLTest_AssertCheck(invalid != NULL, "Check surface creation");
     SDLTest_AssertCheck(invalid->pixels == NULL, "Check surface pixels are NULL");
+    zero_width = SDL_CreateSurfaceFrom(0, 1, SDL_PIXELFORMAT_RGBA8888, pixels, sizeof(pixels));
+    SDLTest_AssertCheck(zero_width != NULL, "Check zero-width surface creation");
+    zero_height = SDL_CreateSurfaceFrom(1, 0, SDL_PIXELFORMAT_RGBA8888, pixels, sizeof(pixels));
+    SDLTest_AssertCheck(zero_height != NULL, "Check zero-height surface creation");
 
     result = SDL_BlitSurface(invalid, NULL, valid, NULL);
     SDLTest_AssertCheck(result == false, "SDL_BlitSurface(invalid, NULL, valid, NULL), result = %s", result ? "true" : "false");
@@ -2092,9 +2107,134 @@ static int SDLCALL surface_testBlitInvalid(void *arg)
     result = SDL_BlitSurfaceScaled(valid, NULL, invalid, NULL, SDL_SCALEMODE_NEAREST);
     SDLTest_AssertCheck(result == false, "SDL_BlitSurfaceScaled(valid, NULL, invalid, NULL, SDL_SCALEMODE_NEAREST), result = %s", result ? "true" : "false");
 
+    result = SDL_BlitSurface(zero_width, NULL, valid, NULL);
+    SDLTest_AssertCheck(result == false, "SDL_BlitSurface(zero-width, NULL, valid, NULL), result = %s", result ? "true" : "false");
+    result = SDL_BlitSurface(valid, NULL, zero_height, NULL);
+    SDLTest_AssertCheck(result == false, "SDL_BlitSurface(valid, NULL, zero-height, NULL), result = %s", result ? "true" : "false");
+    result = SDL_BlitSurfaceTiled(zero_width, NULL, valid, NULL);
+    SDLTest_AssertCheck(result == false, "SDL_BlitSurfaceTiled(zero-width, NULL, valid, NULL), result = %s", result ? "true" : "false");
+    result = SDL_BlitSurface9Grid(zero_height, NULL, 0, 0, 0, 0, 1.0f, SDL_SCALEMODE_NEAREST, valid, NULL);
+    SDLTest_AssertCheck(result == false, "SDL_BlitSurface9Grid(zero-height, NULL, ...), result = %s", result ? "true" : "false");
+
     SDL_DestroySurface(valid);
     SDL_DestroySurface(invalid);
+    SDL_DestroySurface(zero_width);
+    SDL_DestroySurface(zero_height);
 
+    return TEST_COMPLETED;
+}
+
+/**
+ * Tests that unchecked blits reject rectangles outside the surface.
+ */
+static int SDLCALL surface_testBlitUncheckedOutOfBounds(void *arg)
+{
+    const SDL_Rect bad_src[] = {
+        { -1, 0, 2, 2 },
+        { 0, -1, 2, 2 },
+        { 3, 3, 2, 2 },
+        { 0, 0, 5, 4 },
+        { 4, 0, 1, 1 },
+        { 0, 0, 0, 1 },
+        { 0, 0, 1, -1 }
+    };
+    const SDL_Rect good = { 0, 0, 4, 4 };
+    const SDL_Rect bad_dst[] = {
+        { -1, 0, 4, 4 },
+        { 0, -1, 4, 4 },
+        { 1, 1, 4, 4 },
+        { 0, 0, 5, 4 },
+        { 0, 0, 0, 0 },
+        { 0, 0, 4, -1 }
+    };
+    SDL_Surface *src, *dst, *reference;
+    bool result;
+    int i;
+
+    src = SDL_CreateSurface(4, 4, SDL_PIXELFORMAT_RGBA8888);
+    dst = SDL_CreateSurface(4, 4, SDL_PIXELFORMAT_RGBA8888);
+    reference = SDL_CreateSurface(4, 4, SDL_PIXELFORMAT_RGBA8888);
+    SDLTest_AssertCheck(src && dst && reference, "Check surface creation");
+    if (!src || !dst || !reference) {
+        SDL_DestroySurface(src);
+        SDL_DestroySurface(dst);
+        SDL_DestroySurface(reference);
+        return TEST_ABORTED;
+    }
+    SDL_SetSurfaceBlendMode(src, SDL_BLENDMODE_NONE);
+    SDL_SetSurfaceBlendMode(dst, SDL_BLENDMODE_NONE);
+    SDL_FillSurfaceRect(src, NULL, SDL_MapSurfaceRGBA(src, 0x12, 0x34, 0x56, 0x78));
+    SDL_FillSurfaceRect(dst, NULL, SDL_MapSurfaceRGBA(dst, 0x87, 0x65, 0x43, 0x21));
+    SDL_FillSurfaceRect(reference, NULL, SDL_MapSurfaceRGBA(reference, 0x87, 0x65, 0x43, 0x21));
+
+    for (i = 0; i < SDL_arraysize(bad_src); ++i) {
+        SDL_ClearError();
+        result = SDL_BlitSurfaceUnchecked(src, &bad_src[i], dst, &good);
+        SDLTest_AssertCheck(result == false, "SDL_BlitSurfaceUnchecked() rejects bad srcrect %d", i);
+        SDLTest_AssertCheck(SDL_GetError()[0] != '\0', "SDL_BlitSurfaceUnchecked() sets an error for bad srcrect %d", i);
+        SDLTest_AssertCheck(SDLTest_CompareSurfaces(dst, reference, 0) == 0, "Bad srcrect %d left the destination unchanged", i);
+    }
+    for (i = 0; i < SDL_arraysize(bad_dst); ++i) {
+        SDL_ClearError();
+        result = SDL_BlitSurfaceUncheckedScaled(src, &good, dst, &bad_dst[i], SDL_SCALEMODE_NEAREST);
+        SDLTest_AssertCheck(result == false, "SDL_BlitSurfaceUncheckedScaled() rejects bad dstrect %d", i);
+        SDLTest_AssertCheck(SDL_GetError()[0] != '\0', "SDL_BlitSurfaceUncheckedScaled() sets an error for bad dstrect %d", i);
+        SDLTest_AssertCheck(SDLTest_CompareSurfaces(dst, reference, 0) == 0, "Bad dstrect %d left the destination unchanged", i);
+    }
+
+    SDL_ClearError();
+    result = SDL_BlitSurfaceUnchecked(src, &good, dst, &good);
+    SDLTest_AssertCheck(result == true, "SDL_BlitSurfaceUnchecked() accepts an in-bounds rectangle");
+    SDLTest_AssertCheck(SDLTest_CompareSurfaces(dst, src, 0) == 0, "In-bounds unchecked blit copied every pixel");
+
+    SDL_DestroySurface(src);
+    SDL_DestroySurface(dst);
+    SDL_DestroySurface(reference);
+    return TEST_COMPLETED;
+}
+
+/**
+ * Tests that overflowing scaled rectangles fail before allocating.
+ */
+static int SDLCALL surface_testBlitScaledOverflow(void *arg)
+{
+    SDL_Surface *src, *dst;
+    SDL_Rect srcrect = { 0, 0, 4, 4 };
+    SDL_Rect dstrect;
+    bool result;
+
+    src = SDL_CreateSurface(4, 4, SDL_PIXELFORMAT_RGBA8888);
+    dst = SDL_CreateSurface(4, 4, SDL_PIXELFORMAT_RGBA8888);
+    SDLTest_AssertCheck(src && dst, "Check surface creation");
+    if (!src || !dst) {
+        SDL_DestroySurface(src);
+        SDL_DestroySurface(dst);
+        return TEST_ABORTED;
+    }
+
+    dstrect.x = 0;
+    dstrect.y = 0;
+    dstrect.w = SDL_MAX_SINT32 / 2;
+    dstrect.h = SDL_MAX_SINT32 / 2;
+    SDL_ClearError();
+    result = SDL_BlitSurfaceScaled(src, &srcrect, dst, &dstrect, SDL_SCALEMODE_NEAREST);
+    SDLTest_AssertCheck(result == false, "SDL_BlitSurfaceScaled() rejects overflowing destination dimensions");
+    SDLTest_AssertCheck(SDL_GetError()[0] != '\0', "SDL_BlitSurfaceScaled() sets an error for overflowing dimensions");
+
+    dstrect.w = 0;
+    dstrect.h = 4;
+    SDL_ClearError();
+    result = SDL_BlitSurfaceScaled(src, &srcrect, dst, &dstrect, SDL_SCALEMODE_NEAREST);
+    SDLTest_AssertCheck(result == false, "SDL_BlitSurfaceScaled() rejects zero-sized destinations");
+    SDLTest_AssertCheck(SDL_GetError()[0] != '\0', "SDL_BlitSurfaceScaled() sets an error for zero-sized destinations");
+
+    SDL_ClearError();
+    result = SDL_BlitSurfaceTiledWithScale(src, &srcrect, 0.0f, SDL_SCALEMODE_NEAREST, dst, NULL);
+    SDLTest_AssertCheck(result == false, "SDL_BlitSurfaceTiledWithScale() rejects zero scale");
+    SDLTest_AssertCheck(SDL_GetError()[0] != '\0', "SDL_BlitSurfaceTiledWithScale() sets an error for zero scale");
+
+    SDL_DestroySurface(src);
+    SDL_DestroySurface(dst);
     return TEST_COMPLETED;
 }
 
@@ -2120,16 +2260,16 @@ static int SDLCALL surface_testBlitsWithBadCoordinates(void *arg)
 
     for (i = 0; i < 8; i++) {
         result = SDL_BlitSurface(s, NULL, s, &rect[i]);
-        SDLTest_AssertCheck(result == true, "SDL_BlitSurface(valid, NULL, valid, &rect), result = %s", result ? "true" : "false");
+        SDLTest_AssertCheck(result == false, "SDL_BlitSurface(valid, NULL, valid, &rect), result = %s", result ? "true" : "false");
 
         result = SDL_BlitSurface(s, &rect[i], s, NULL);
-        SDLTest_AssertCheck(result == true, "SDL_BlitSurface(valid, &rect, valid, NULL), result = %s", result ? "true" : "false");
+        SDLTest_AssertCheck(result == false, "SDL_BlitSurface(valid, &rect, valid, NULL), result = %s", result ? "true" : "false");
 
         result = SDL_BlitSurfaceScaled(s, NULL, s, &rect[i], SDL_SCALEMODE_NEAREST);
-        SDLTest_AssertCheck(result == true, "SDL_BlitSurfaceScaled(valid, NULL, valid, &rect, SDL_SCALEMODE_NEAREST), result = %s", result ? "true" : "false");
+        SDLTest_AssertCheck(result == false, "SDL_BlitSurfaceScaled(valid, NULL, valid, &rect, SDL_SCALEMODE_NEAREST), result = %s", result ? "true" : "false");
 
         result = SDL_BlitSurfaceScaled(s, &rect[i], s, NULL, SDL_SCALEMODE_NEAREST);
-        SDLTest_AssertCheck(result == true, "SDL_BlitSurfaceScaled(valid, &rect, valid, NULL, SDL_SCALEMODE_NEAREST), result = %s", result ? "true" : "false");
+        SDLTest_AssertCheck(result == false, "SDL_BlitSurfaceScaled(valid, &rect, valid, NULL, SDL_SCALEMODE_NEAREST), result = %s", result ? "true" : "false");
     }
 
     SDL_DestroySurface(s);
@@ -2983,6 +3123,14 @@ static const SDLTest_TestCaseReference surfaceTestBlitInvalid = {
     surface_testBlitInvalid, "surface_testBlitInvalid", "Tests blitting routines with invalid surfaces.", TEST_ENABLED
 };
 
+static const SDLTest_TestCaseReference surfaceTestBlitUncheckedOutOfBounds = {
+    surface_testBlitUncheckedOutOfBounds, "surface_testBlitUncheckedOutOfBounds", "Tests that unchecked blits reject out-of-bounds rectangles.", TEST_ENABLED
+};
+
+static const SDLTest_TestCaseReference surfaceTestBlitScaledOverflow = {
+    surface_testBlitScaledOverflow, "surface_testBlitScaledOverflow", "Tests scaled blits with overflowing rectangles.", TEST_ENABLED
+};
+
 static const SDLTest_TestCaseReference surfaceTestBlitsWithBadCoordinates = {
     surface_testBlitsWithBadCoordinates, "surface_testBlitsWithBadCoordinates", "Test blitting routines with bad coordinates.", TEST_ENABLED
 };
@@ -3050,6 +3198,8 @@ static const SDLTest_TestCaseReference *surfaceTests[] = {
     &surfaceTestBlitBlendMul,
     &surfaceTestBlitBitmap,
     &surfaceTestBlitInvalid,
+    &surfaceTestBlitUncheckedOutOfBounds,
+    &surfaceTestBlitScaledOverflow,
     &surfaceTestBlitsWithBadCoordinates,
     &surfaceTestOverflow,
     &surfaceTestSetGetClipRect,
